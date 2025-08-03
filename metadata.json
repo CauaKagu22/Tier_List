@@ -1,0 +1,5 @@
+{
+  "name": "Gerador de Tier List de Séries",
+  "description": "Crie tier lists para episódios de suas séries favoritas. Cole um link do TMDB, arraste e solte os episódios nas categorias para classificar.",
+  "requestFramePermissions": []
+}
