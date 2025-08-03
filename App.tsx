@@ -1,4 +1,4 @@
-import React, { useState, useCallback, FormEvent, useEffect } from 'react';
+import React, { useState, useCallback, FormEvent, useEffect, useRef } from 'react';
 import {
   DndContext,
   useDraggable,
@@ -7,7 +7,8 @@ import {
   DragEndEvent,
   DragStartEvent,
 } from '@dnd-kit/core';
-import { getTvShowDetails, fetchAllEpisodes } from './services/tmdbService';
+import html2canvas from 'html2canvas';
+import { getTvShowDetails, fetchAllEpisodes, imageToDataUrl, PLACEHOLDER_IMAGE_URL } from './services/tmdbService';
 import { TIER_RANKS, UNRANKED_POOL_ID } from './constants';
 import type { Episode, Tiers, UnrankedSeasons, TvShowSearchResult } from './types';
 
@@ -18,6 +19,13 @@ const Spinner: React.FC = () => (
     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
   </svg>
+);
+
+const SmallSpinner: React.FC = () => (
+    <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+    </svg>
 );
 
 const ChevronIcon: React.FC<{ isCollapsed: boolean }> = ({ isCollapsed }) => (
@@ -155,6 +163,8 @@ const App: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeEpisode, setActiveEpisode] = useState<Episode | null>(null);
+  const [isSavingImage, setIsSavingImage] = useState(false);
+  const tierListRef = useRef<HTMLDivElement>(null);
 
   const toggleSeasonCollapse = (seasonNum: number) => {
     setCollapsedSeasons(prev => ({ ...prev, [seasonNum]: !prev[seasonNum] }));
@@ -212,7 +222,16 @@ const App: React.FC = () => {
   useEffect(() => {
     if (selectedShow && !loading) {
       const stateToSave = { tiers, unrankedSeasons };
-      localStorage.setItem(`tierListState_${selectedShow.id}`, JSON.stringify(stateToSave));
+      try {
+        localStorage.setItem(`tierListState_${selectedShow.id}`, JSON.stringify(stateToSave));
+      } catch (e) {
+        console.error("Failed to save state to localStorage:", e);
+        if (e instanceof DOMException && (e.name === 'QuotaExceededError' || e.code === 22)) {
+            setError("Não foi possível salvar seu progresso. O armazenamento do navegador está cheio.");
+        } else {
+            setError("Ocorreu um erro ao salvar seu progresso.");
+        }
+      }
     }
   }, [tiers, unrankedSeasons, selectedShow, loading]);
 
@@ -236,64 +255,148 @@ const App: React.FC = () => {
   const handleDragEnd = (event: DragEndEvent) => {
     setActiveEpisode(null);
     const { active, over } = event;
-    
-    if (!over || !active.data.current) return;
 
-    const itemData = active.data.current as { episode: Episode; sourceInfo: { sourceTier: string; sourceSeason?: number } };
-    const { episode, sourceInfo } = itemData;
-    const { sourceTier, sourceSeason } = sourceInfo;
-    
-    const overId = over.id as string;
-    let targetTier: string;
-    let targetSeason: number | undefined;
-
-    if (overId.startsWith('unranked-')) {
-        targetTier = UNRANKED_POOL_ID;
-        targetSeason = parseInt(overId.split('-')[1], 10);
-    } else {
-        targetTier = overId;
+    if (!over || !active.data.current) {
+      return;
     }
 
-    if (targetTier === sourceTier && (sourceTier !== UNRANKED_POOL_ID || targetSeason === sourceSeason)) return;
+    const { episode, sourceInfo } = active.data.current as {
+      episode: Episode;
+      sourceInfo: { sourceTier: string; sourceSeason?: number };
+    };
+    const { sourceTier, sourceSeason } = sourceInfo;
 
-    // State update logic
-    setTiers(prevTiers => {
-      const newTiers = { ...prevTiers };
-      
-      setUnrankedSeasons(prevSeasons => {
-        const newSeasons = { ...prevSeasons };
+    const overId = over.id.toString();
+    const isTargetUnranked = overId.startsWith('unranked-');
+    const targetTierName = isTargetUnranked ? UNRANKED_POOL_ID : overId;
+    const targetSeasonNum = isTargetUnranked ? parseInt(overId.split('-')[1], 10) : undefined;
 
-        // Remove from source
-        if (sourceTier === UNRANKED_POOL_ID && sourceSeason !== undefined) {
-          if (newSeasons[sourceSeason]) {
-            newSeasons[sourceSeason] = newSeasons[sourceSeason].filter(ep => ep.id !== episode.id);
-          }
-        } else if (newTiers[sourceTier]) {
-          newTiers[sourceTier] = newTiers[sourceTier].filter(ep => ep.id !== episode.id);
-        }
+    const isSourceUnranked = sourceTier === UNRANKED_POOL_ID;
 
-        // Add to destination
-        if (targetTier === UNRANKED_POOL_ID && targetSeason !== undefined) {
-           if (!newSeasons[targetSeason]) newSeasons[targetSeason] = [];
-           newSeasons[targetSeason].push(episode);
-           newSeasons[targetSeason].sort((a,b) => a.episode_number - b.episode_number);
-        } else if (newTiers[targetTier]) {
-          if (!newTiers[targetTier]) newTiers[targetTier] = [];
-          newTiers[targetTier].push(episode);
-        }
-        
-        return newSeasons;
-      });
+    // Exit if it's dropped in the same place
+    if (sourceTier === targetTierName && (!isSourceUnranked || sourceSeason === targetSeasonNum)) {
+      return;
+    }
 
-      return newTiers;
-    });
+    // Create new state objects based on the current state to ensure atomicity.
+    const newTiers = { ...tiers };
+    const newUnrankedSeasons = { ...unrankedSeasons };
+
+    // 1. Remove episode from its source container
+    if (isSourceUnranked) {
+      if (sourceSeason !== undefined && newUnrankedSeasons[sourceSeason]) {
+        newUnrankedSeasons[sourceSeason] = newUnrankedSeasons[sourceSeason].filter(ep => ep.id !== episode.id);
+      }
+    } else {
+      if (newTiers[sourceTier]) {
+        newTiers[sourceTier] = newTiers[sourceTier].filter(ep => ep.id !== episode.id);
+      }
+    }
+
+    // 2. Add episode to its destination container
+    if (isTargetUnranked) {
+      if (targetSeasonNum !== undefined) {
+        newUnrankedSeasons[targetSeasonNum] = [...(newUnrankedSeasons[targetSeasonNum] || []), episode]
+          .sort((a, b) => a.episode_number - b.episode_number);
+      }
+    } else {
+      newTiers[targetTierName] = [...(newTiers[targetTierName] || []), episode];
+    }
+    
+    setTiers(newTiers);
+    setUnrankedSeasons(newUnrankedSeasons);
   };
 
   const handleReset = () => {
     if (!selectedShow) return;
-    if (window.confirm(`Tem certeza de que deseja redefinir a tier list para "${selectedShow.name}"? Todo o progresso será perdido.`)) {
-      localStorage.removeItem(`tierListState_${selectedShow.id}`);
-      loadShow(selectedShow.id);
+    if (true) {
+      const resetFlow = async () => {
+        setLoading(true);
+        setError(null);
+        localStorage.removeItem(`tierListState_${selectedShow.id}`);
+
+        try {
+          // Re-fetch all episodes from scratch to ensure we have the pristine state
+          const episodes = await fetchAllEpisodes(selectedShow.id);
+          const seasons: UnrankedSeasons = {};
+          episodes.forEach(ep => {
+            if (!seasons[ep.season_number]) {
+              seasons[ep.season_number] = [];
+            }
+            seasons[ep.season_number].push(ep);
+          });
+          
+          // Atomically update state to reset the board
+          setTiers(TIER_RANKS.reduce((acc, tier) => ({ ...acc, [tier.name]: [] }), {}));
+          setUnrankedSeasons(seasons);
+          setCollapsedSeasons({});
+
+        } catch (err) {
+          setError("Falha ao redefinir a série. Tente carregar a série novamente.");
+        } finally {
+          setLoading(false);
+        }
+      };
+      resetFlow();
+    }
+  };
+
+  const handleSaveImage = async () => {
+    if (!tierListRef.current || !selectedShow) return;
+
+    setIsSavingImage(true);
+    setError(null);
+
+    const elementToCapture = tierListRef.current;
+    
+    // We clone the node to modify it without affecting the live DOM or React state.
+    const clonedElement = elementToCapture.cloneNode(true) as HTMLElement;
+    clonedElement.style.position = 'absolute';
+    clonedElement.style.left = '-9999px';
+    clonedElement.style.top = `${window.scrollY}px`; // Position it correctly vertically for scroll
+    document.body.appendChild(clonedElement);
+
+    try {
+        // Find all episode cards which have background images to convert
+        const episodeCards = clonedElement.querySelectorAll<HTMLDivElement>('div[style*="background-image"]');
+        
+        const conversionPromises = Array.from(episodeCards).map(async (card) => {
+            const bgImageStyle = card.style.backgroundImage;
+            const urlMatch = bgImageStyle.match(/url\("(.+?)"\)/);
+            if (urlMatch && urlMatch[1]) {
+                const originalUrl = urlMatch[1];
+                // Only convert real images, not placeholders or already-data-urls
+                if (originalUrl && !originalUrl.startsWith('data:') && originalUrl !== PLACEHOLDER_IMAGE_URL) {
+                    try {
+                        const dataUrl = await imageToDataUrl(originalUrl);
+                        card.style.backgroundImage = `url("${dataUrl}")`;
+                    } catch (e) {
+                        console.warn(`Could not convert image for canvas capture: ${originalUrl}`, e);
+                    }
+                }
+            }
+        });
+
+        await Promise.all(conversionPromises);
+
+        const canvas = await html2canvas(clonedElement, {
+            backgroundColor: '#0f172a',
+            scale: window.devicePixelRatio,
+        });
+
+        const link = document.createElement('a');
+        link.href = canvas.toDataURL('image/png');
+        const safeFilename = selectedShow.name.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+        link.download = `tierlist_${safeFilename}.png`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    } catch (error) {
+        console.error("Failed to save image:", error);
+        setError("Não foi possível salvar a imagem. Tente novamente.");
+    } finally {
+        document.body.removeChild(clonedElement);
+        setIsSavingImage(false);
     }
   };
   
@@ -342,50 +445,72 @@ const App: React.FC = () => {
 
           {selectedShow && (
             <main className="mt-10">
-               <div className="text-center mb-6 flex flex-col sm:flex-row items-center justify-center gap-4">
-                <h2 className="text-3xl font-bold text-yellow-400">{selectedShow.name}</h2>
+              <div ref={tierListRef} className="bg-slate-900 rounded-lg p-4 sm:p-6 mb-6">
+                 <div className="text-center mb-6">
+                    <h2 className="text-3xl font-bold text-yellow-400">{selectedShow.name}</h2>
+                    <p className="text-xs text-gray-500 mt-1">
+                      Gerado com o Gerador de Tier List de Séries
+                    </p>
+                </div>
+
+                {loading ? (
+                    <div className="text-center py-20 flex flex-col items-center">
+                        <Spinner />
+                        <p className="mt-4 text-lg text-gray-300">Carregando episódios...</p>
+                    </div>
+                ) : (
+                  <div>
+                    {TIER_RANKS.map(tier => (
+                      <TierRow
+                        key={tier.name}
+                        tierName={tier.name}
+                        tierColor={tier.color}
+                        tierTextColor={tier.textColor}
+                        episodes={tiers[tier.name] || []}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+              
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-8">
+                <button
+                  onClick={handleSaveImage}
+                  disabled={isSavingImage || loading}
+                  className="bg-green-600 hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed text-white font-semibold py-2 px-4 rounded-lg transition-colors text-sm flex items-center justify-center gap-2 w-full sm:w-auto"
+                  title="Salvar a tier list como imagem"
+                >
+                  {isSavingImage ? (
+                    <><SmallSpinner/> Salvando...</>
+                  ) : (
+                    'Salvar Imagem'
+                  )}
+                </button>
                 <button
                   onClick={handleReset}
-                  className="bg-red-700 hover:bg-red-800 text-white font-semibold py-2 px-4 rounded-lg transition-colors text-sm"
+                  disabled={loading}
+                  className="bg-red-700 hover:bg-red-800 disabled:bg-gray-500 disabled:cursor-not-allowed text-white font-semibold py-2 px-4 rounded-lg transition-colors text-sm w-full sm:w-auto"
                   title="Redefinir a tier list desta série"
                 >
                   Redefinir
                 </button>
               </div>
-              {loading ? (
-                  <div className="text-center mt-12 flex flex-col items-center">
-                      <Spinner />
-                      <p className="mt-4 text-lg text-gray-300">Carregando episódios...</p>
-                  </div>
-              ) : (
-              <>
-              <div className="mb-8">
-                {TIER_RANKS.map(tier => (
-                  <TierRow
-                    key={tier.name}
-                    tierName={tier.name}
-                    tierColor={tier.color}
-                    tierTextColor={tier.textColor}
-                    episodes={tiers[tier.name] || []}
-                  />
-                ))}
-              </div>
 
-              <div className="bg-slate-800/60 p-4 rounded-lg">
-                <h3 className="text-2xl font-bold text-center mb-4 border-b-2 border-purple-600 pb-2">Episódios Não Classificados</h3>
-                {hasUnrankedEpisodes ? seasonNumbers.map(seasonNum => (
-                    <UnrankedSeasonRow
-                      key={seasonNum}
-                      seasonNum={seasonNum}
-                      episodes={unrankedSeasons[seasonNum] || []}
-                      isCollapsed={!!collapsedSeasons[seasonNum]}
-                      toggleCollapse={() => toggleSeasonCollapse(seasonNum)}
-                    />
-                )) : (
-                  <p className="text-center text-gray-400 py-8">Todos os episódios foram classificados!</p>
-                )}
-              </div>
-              </>
+              {!loading && (
+                <div className="bg-slate-800/60 p-4 rounded-lg">
+                  <h3 className="text-2xl font-bold text-center mb-4 border-b-2 border-purple-600 pb-2">Episódios Não Classificados</h3>
+                  {hasUnrankedEpisodes ? seasonNumbers.map(seasonNum => (
+                      <UnrankedSeasonRow
+                        key={seasonNum}
+                        seasonNum={seasonNum}
+                        episodes={unrankedSeasons[seasonNum] || []}
+                        isCollapsed={!!collapsedSeasons[seasonNum]}
+                        toggleCollapse={() => toggleSeasonCollapse(seasonNum)}
+                      />
+                  )) : (
+                    <p className="text-center text-gray-400 py-8">Todos os episódios foram classificados!</p>
+                  )}
+                </div>
               )}
             </main>
           )}
